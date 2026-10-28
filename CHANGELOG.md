@@ -19,11 +19,24 @@ This file was introduced at v0.44.0; for the history of earlier releases see the
   the frame went out and the server closed the connection, failing every
   in-flight call and stream along with it. An oversized subscription reports
   the error through `onError` and is dropped instead of being retried on
-  every reconnect. Each `config` frame replaces the limit, so servers that
-  disable it, or predate the field, get no local check. The limit carries
-  over a reconnect: calls queued while disconnected are flushed as the socket
-  opens, before the new `config` frame, and are checked against the last
-  advertised limit. The Go client already did this (`ErrMessageTooLarge`).
+  every reconnect. Servers that disable the limit, or predate the field, get
+  no local check. The Go client already did this (`ErrMessageTooLarge`).
+- **`ClientTransport.setMaxMessageSize`** (optional). The client passes it
+  the server's `maxMessageSize`, and a transport that implements it throws
+  `MessageTooLargeError` from `send()` for a larger frame. The built-in
+  WebSocket transport does this, serializing each frame once. A `send()` that
+  throws now fails only the call that built the frame, instead of leaving it
+  pending.
+
+### Changed
+
+- **The TypeScript client waits for the server's `config` frame before
+  sending.** Calls, resubscribes, and streams queued while connecting or
+  reconnecting go out once that connection's `config` frame has arrived, so
+  they are checked against the limit of the server they go to. `connect()`
+  resolves at the same point. Both server transports send `config` first on
+  every connection. A custom `ClientTransport` that drops it makes the client
+  wait `connectTimeout` (default 10 s) and then go on without a known limit.
 
 ## [0.65.0] - 2026-10-03
 

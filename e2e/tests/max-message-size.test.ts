@@ -1,7 +1,7 @@
-import { describe, test, expect, afterEach } from 'vitest';
+import { describe, test, expect, afterEach, vi } from 'vitest';
 import { wsSmallLimitUrl, wsNoLimitUrl } from './helpers';
-import { ApiClient, MessageTooLargeError, type ConnectionState } from '../api/client';
-import { setBlob } from '../api/blob-handlers';
+import { ApiClient, MessageTooLargeError, type ClientTransport, type ConnectionState, type TransportCloseInfo } from '../api/client';
+import { setBlob, subscribeSetBlob } from '../api/blob-handlers';
 import { getConnURL } from '../api/conn-handlers';
 
 // The /ws-small server advertises maxMessageSize 4096 in its config frame. A
@@ -9,25 +9,53 @@ import { getConnURL } from '../api/conn-handlers';
 // every call on it, so the client must refuse it locally and fail only the
 // call that built it.
 const LIMIT = 4096;
+const BIG = 'x'.repeat(LIMIT * 2);
 
-// connected opens a client and waits for the server's config frame: it is
-// the first frame on the connection, so it has been applied once any
-// response arrives.
-async function connected(url: string): Promise<{ client: ApiClient; states: ConnectionState[] }> {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function newClient(url: string | (() => string)): { client: ApiClient; states: ConnectionState[] } {
     const client = new ApiClient(url, { reconnectInterval: 50, reconnectMaxInterval: 50 });
     const states: ConnectionState[] = [];
     client.onStateChange((s) => states.push(s));
-    await client.connect();
-    await getConnURL(client);
     return { client, states };
+}
+
+// connected opens a client and makes one round trip, so the config frame
+// has been applied whatever connect() waits for. 'a call made before the
+// first config frame is checked' covers what connect() itself waits for.
+async function connected(url: string | (() => string)): Promise<{ client: ApiClient; states: ConnectionState[] }> {
+    const c = newClient(url);
+    await c.client.connect();
+    await getConnURL(c.client);
+    return c;
 }
 
 async function waitForState(client: ApiClient, state: ConnectionState): Promise<void> {
     const deadline = Date.now() + 2000;
     while (client.getState() !== state) {
         if (Date.now() > deadline) throw new Error(`state stayed ${client.getState()}, want ${state}`);
-        await new Promise((r) => setTimeout(r, 5));
+        await sleep(5);
     }
+}
+
+// dropSocket closes the socket without disconnect(), so the client
+// reconnects.
+async function dropSocket(client: ApiClient): Promise<void> {
+    (client as unknown as { transport: { disconnect: () => void } }).transport.disconnect();
+    await waitForState(client, 'reconnecting');
+}
+
+// recordFrames records every frame the client hands its transport, including
+// ones the transport then refuses.
+function recordFrames(client: ApiClient): Array<Record<string, unknown>> {
+    const frames: Array<Record<string, unknown>> = [];
+    const t = (client as unknown as { transport: ClientTransport }).transport;
+    const send = t.send.bind(t);
+    t.send = (m: object) => {
+        frames.push(m as Record<string, unknown>);
+        send(m);
+    };
+    return frames;
 }
 
 describe('maxMessageSize from the config frame', () => {
@@ -36,13 +64,14 @@ describe('maxMessageSize from the config frame', () => {
     afterEach(() => {
         client?.disconnect();
         client = undefined;
+        vi.restoreAllMocks();
     });
 
     test('an oversized request fails locally and the connection stays up', async () => {
         const c = await connected(wsSmallLimitUrl());
         client = c.client;
 
-        const err = await setBlob(client, 'x'.repeat(LIMIT * 2)).catch((e: unknown) => e);
+        const err = await setBlob(client, BIG).catch((e: unknown) => e);
         expect(err).toBeInstanceOf(MessageTooLargeError);
         const tooLarge = err as MessageTooLargeError;
         expect(tooLarge.limit).toBe(LIMIT);
@@ -66,6 +95,11 @@ describe('maxMessageSize from the config frame', () => {
         expect(err).toBeInstanceOf(MessageTooLargeError);
         expect((err as MessageTooLargeError).size).toBeGreaterThan(6000);
 
+        // 1500 four-byte characters (surrogate pairs) are 6000 bytes too.
+        const emoji = await setBlob(client, '😀'.repeat(1500)).catch((e: unknown) => e);
+        expect(emoji).toBeInstanceOf(MessageTooLargeError);
+        expect((emoji as MessageTooLargeError).size).toBeGreaterThan(6000);
+
         // 3000 single-byte characters fit.
         await expect(setBlob(client, 'e'.repeat(3000))).resolves.toBeNull();
     });
@@ -76,8 +110,8 @@ describe('maxMessageSize from the config frame', () => {
 
         const errors: Error[] = [];
         const results: unknown[] = [];
-        client.subscribe('BlobHandlers.GetBlob', ['x'.repeat(LIMIT * 2)], (r) => results.push(r), (e) => errors.push(e));
-        await new Promise((r) => setTimeout(r, 50));
+        client.subscribe('BlobHandlers.GetBlob', [BIG], (r) => results.push(r), (e) => errors.push(e));
+        await sleep(50);
 
         expect(errors).toHaveLength(1);
         expect(errors[0]).toBeInstanceOf(MessageTooLargeError);
@@ -92,30 +126,125 @@ describe('maxMessageSize from the config frame', () => {
         client = (await connected(wsSmallLimitUrl())).client;
 
         const iterate = async () => {
-            for await (const _ of client!.requestStream('StreamingHandlers.Numbers', ['x'.repeat(LIMIT * 2)])) {
+            for await (const _ of client!.requestStream('StreamingHandlers.Numbers', [BIG])) {
                 // Never reached: the stream fails before it is sent.
             }
         };
         await expect(iterate()).rejects.toBeInstanceOf(MessageTooLargeError);
         expect(client.getState()).toBe('connected');
+        expect(client.getLoadingCount()).toBe(0);
         await expect(getConnURL(client)).resolves.toBeDefined();
     });
 
-    test('a request queued during a reconnect is checked when it is flushed', async () => {
-        client = (await connected(wsSmallLimitUrl())).client;
+    test('a call made before the first config frame is checked', async () => {
+        const c = newClient(wsSmallLimitUrl());
+        client = c.client;
 
-        // Drop the socket without disconnect(), so the client reconnects.
-        (client as unknown as { transport: { disconnect: () => void } }).transport.disconnect();
-        await waitForState(client, 'reconnecting');
-
-        const oversized = setBlob(client, 'x'.repeat(LIMIT * 2)).catch((e: unknown) => e);
+        // Both are buffered while connecting and sent only once the config
+        // frame has set the limit.
+        const connecting = client.connect();
+        const oversized = setBlob(client, BIG).catch((e: unknown) => e);
         const fits = setBlob(client, 'fits');
+        await connecting;
 
-        // Both are flushed as the socket opens, before the new connection's
-        // config frame arrives, so the last advertised limit applies.
         expect(await oversized).toBeInstanceOf(MessageTooLargeError);
         await expect(fits).resolves.toBeNull();
+        expect(c.states).toEqual(['connecting', 'connected']);
+    });
+
+    test('after a reconnect, the new server\'s higher limit applies', async () => {
+        let url = wsSmallLimitUrl();
+        const c = await connected(() => url);
+        client = c.client;
+
+        // The server comes back with no limit.
+        url = wsNoLimitUrl();
+        await dropSocket(client);
+        const errors: Error[] = [];
+        const results: unknown[] = [];
+        subscribeSetBlob(client, BIG, (r) => results.push(r), (e) => errors.push(e));
+        const request = setBlob(client, BIG);
+
+        await expect(request).resolves.toBeNull();
+        await sleep(50);
+        expect(errors).toEqual([]);
+        expect(results).toHaveLength(1);
         expect(client.getState()).toBe('connected');
+    });
+
+    test('after a reconnect, the new server\'s lower limit applies', async () => {
+        let url = wsNoLimitUrl();
+        const c = await connected(() => url);
+        client = c.client;
+
+        // The server comes back with a 4096-byte limit. Sending the queued
+        // oversized request would make it close the connection.
+        url = wsSmallLimitUrl();
+        await dropSocket(client);
+        const oversized = setBlob(client, BIG).catch((e: unknown) => e);
+        const fits = setBlob(client, 'fits');
+
+        expect(await oversized).toBeInstanceOf(MessageTooLargeError);
+        await expect(fits).resolves.toBeNull();
+        await sleep(50);
+        expect(c.states).toEqual(['connecting', 'connected', 'reconnecting', 'connected']);
+    });
+
+    test('aborting a refused request sends no cancel', async () => {
+        client = (await connected(wsSmallLimitUrl())).client;
+        const frames = recordFrames(client);
+
+        const ac = new AbortController();
+        const err = await setBlob(client, BIG, { signal: ac.signal }).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(MessageTooLargeError);
+        ac.abort();
+        await sleep(10);
+
+        expect(frames.filter((f) => f.type === 'cancel')).toEqual([]);
+        expect(client.getLoadingCount()).toBe(0);
+    });
+
+    test('params that cannot be serialized fail only that call', async () => {
+        client = (await connected(wsSmallLimitUrl())).client;
+
+        const err = await setBlob(client, 1n as unknown as string).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(TypeError);
+        expect(client.getLoadingCount()).toBe(0);
+
+        // In a flush, the calls after it are still sent.
+        await dropSocket(client);
+        const bad = setBlob(client, 1n as unknown as string).catch((e: unknown) => e);
+        const fits = setBlob(client, 'fits');
+        expect(await bad).toBeInstanceOf(TypeError);
+        await expect(fits).resolves.toBeNull();
+        expect(client.getLoadingCount()).toBe(0);
+    });
+
+    test('an oversized subscription unsubscribed at once reports nothing', async () => {
+        client = (await connected(wsSmallLimitUrl())).client;
+        const frames = recordFrames(client);
+        const reported: Error[] = [];
+        client.onRequestError((e) => reported.push(e));
+
+        // A React effect that subscribes and is cleaned up in the same tick.
+        const errors: Error[] = [];
+        const unsubscribe = client.subscribe('BlobHandlers.GetBlob', [BIG], () => {}, (e) => errors.push(e));
+        unsubscribe();
+        await sleep(20);
+
+        expect(errors).toEqual([]);
+        expect(reported).toEqual([]);
+        // The server never saw the subscription, so there is nothing to end.
+        expect(frames.filter((f) => f.type === 'unsubscribe')).toEqual([]);
+    });
+
+    test('each frame is serialized once', async () => {
+        client = (await connected(wsSmallLimitUrl())).client;
+        const stringify = vi.spyOn(JSON, 'stringify');
+
+        await setBlob(client, 'fits');
+        const requestFrames = stringify.mock.calls.filter(([v]) => (v as { type?: string })?.type === 'request');
+        expect(requestFrames).toHaveLength(1);
     });
 
     test('with no advertised limit nothing is rejected locally', async () => {
@@ -123,5 +252,70 @@ describe('maxMessageSize from the config frame', () => {
 
         await expect(setBlob(client, 'x'.repeat(256 * 1024))).resolves.toBeNull();
         expect(client.getState()).toBe('connected');
+    });
+});
+
+// LimitTransport is a custom transport that enforces the limit itself, the
+// way the ClientTransport contract describes: it answers every request with
+// null, and refuses a frame over the limit it was given.
+class LimitTransport implements ClientTransport {
+    limits: Array<number | undefined> = [];
+    sent: Array<Record<string, unknown>> = [];
+    private onMessage: ((d: string) => void) | null = null;
+    private open = false;
+    constructor(private config: object | null) {}
+
+    connect(_url: string, onMessage: (d: string | Blob | ArrayBuffer) => void, _onClose: (i?: TransportCloseInfo) => void): Promise<void> {
+        this.onMessage = onMessage as (d: string) => void;
+        this.open = true;
+        if (this.config) this.deliver(this.config);
+        return Promise.resolve();
+    }
+    setMaxMessageSize(limit: number | undefined): void {
+        this.limits.push(limit);
+    }
+    send(message: object): void {
+        const data = JSON.stringify(message);
+        const limit = this.limits[this.limits.length - 1];
+        if (limit !== undefined && data.length > limit) throw new MessageTooLargeError(data.length, limit);
+        const m = message as Record<string, unknown>;
+        this.sent.push(m);
+        if (m.type === 'request') this.deliver({ type: 'response', id: m.id, result: null });
+    }
+    private deliver(m: object): void {
+        const cb = this.onMessage;
+        queueMicrotask(() => cb?.(JSON.stringify(m)));
+    }
+    disconnect(): void { this.open = false; }
+    isConnected(): boolean { return this.open; }
+}
+
+describe('maxMessageSize with a custom transport', () => {
+    test('the transport gets the limit and its refusal fails only that call', async () => {
+        const t = new LimitTransport({ type: 'config', maxMessageSize: 100 });
+        const client = new ApiClient('ws://unused', { transport: t, reconnect: false });
+        await client.connect();
+
+        // Cleared for the new connection, then set from its config frame.
+        expect(t.limits).toEqual([undefined, 100]);
+        const err = await client.request('BlobHandlers.SetBlob', ['x'.repeat(200)]).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(MessageTooLargeError);
+        await expect(client.request('BlobHandlers.SetBlob', ['fits'])).resolves.toBeNull();
+        expect(client.getState()).toBe('connected');
+        client.disconnect();
+    });
+
+    test('a transport that never delivers a config frame connects after connectTimeout', async () => {
+        const t = new LimitTransport(null);
+        const client = new ApiClient('ws://unused', { transport: t, reconnect: false, connectTimeout: 50 });
+
+        const started = Date.now();
+        const connecting = client.connect();
+        const request = client.request('BlobHandlers.SetBlob', ['fits']);
+        await connecting;
+        expect(Date.now() - started).toBeGreaterThanOrEqual(40);
+        expect(client.getState()).toBe('connected');
+        await expect(request).resolves.toBeNull();
+        client.disconnect();
     });
 });

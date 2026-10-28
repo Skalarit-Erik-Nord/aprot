@@ -890,7 +890,7 @@ try {
 }
 ```
 
-Each `config` frame replaces the limit, so a server that disables it (`MaxMessageSize: -1`) or predates the field gets no local check. The limit carries over a reconnect: calls queued while disconnected are sent as the socket opens, before the new `config` frame, and are checked against the last advertised limit. Calls sent before the client's first `config` frame are not checked; the server still enforces its limit.
+The client sends nothing on a connection until that connection's `config` frame arrives, so every frame, including calls queued while connecting or reconnecting, is checked against the limit of the server it goes to. A server that disables the limit (`MaxMessageSize: -1`) or predates the field gets no local check.
 
 **Rejections are terminal by default** — after a `server-rejected` failure the client stops auto-reconnecting, which is the right response to a real sign-out. For short-lived credentials, where a rejection is usually an expired token, propagation lag just after sign-in, or clock skew, opt into retries with `reconnectOnRejected` (pair it with `getConnectParams` / `getAuthToken` so each retry carries a fresh token):
 
@@ -1290,6 +1290,8 @@ class BridgeTransport implements ClientTransport {
 const client = new ApiClient('bridge:', { transport: new BridgeTransport() });
 client.connect();
 ```
+
+Forward every server frame, including the first one, `config`: the client waits for it before sending anything, and gives up waiting after `connectTimeout` (then it runs without a known message size limit). To refuse oversized frames locally the way the built-in transport does, implement the optional `setMaxMessageSize(limit)`: the client passes it the server's `maxMessageSize`, and `send()` throws a `MessageTooLargeError` for a larger frame, measured as it goes onto the channel. A `send()` that throws fails only the call that built the frame.
 
 **Electron note:** a renderer can open `ws://127.0.0.1:<port>` directly, so for most Electron apps the simplest wiring is still a loopback WebSocket to the spawned Go process — pair it with `OnAuth` (a spawn-time random token) and `SetCheckOrigin` so other local processes and browser tabs can't connect. Use `ServeStream` + a custom `ClientTransport` when you want no listening port at all: Go child speaks NDJSON on stdio to the main process, which relays to the renderer over a `MessagePort`.
 
