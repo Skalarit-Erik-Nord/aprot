@@ -400,6 +400,8 @@ In-flight requests reject with a `ConnectionError` when the connection drops; ca
 client.onConnectionError(err => showBanner(err.reason));
 const last = client.getLastConnectionError(); // or null
 ```
+**`MessageTooLargeError extends Error`** — the client refused a request, stream, or subscription locally because its frame is larger than the `maxMessageSize` from the server's `config` frame. Has `.size` and `.limit` (bytes of UTF-8 JSON). Only that call fails; the connection stays up (sent, the frame would make the server close the socket and fail every call on it). An oversized subscription gets the error via `onError` and is dropped. Each `config` frame replaces the limit (absent = no check); it carries over a reconnect, so calls queued while disconnected are checked against the last advertised value; calls before the first `config` frame are unchecked.
+
 The `'server-rejected'` bucket is also surfaced via the older `onConnectionRejected` `ApiClientOption` callback (kept for backward compatibility). A rejection is **terminal by default** (stops auto-reconnect — correct for a real sign-out); `reconnectOnRejected: {delayMs, maxAttempts} | true` opts into retrying it (expired token / propagation lag / clock skew), and `disconnect()` cancels a pending retry. `client.getLastRejection()` returns the rejection's `ApiError` (null after the next successful connect) and, unlike `getLastConnectionError()`, is not overwritten by later transport failures — that's the "session expired" vs "server unreachable" distinction.
 
 ## TypeScript Hooks (React Output)

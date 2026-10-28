@@ -10,6 +10,21 @@ This file was introduced at v0.44.0; for the history of earlier releases see the
 
 ## [Unreleased]
 
+### Added
+
+- **The TypeScript client enforces the server's `maxMessageSize`.** A
+  request, stream, or subscription whose frame is larger than the limit in
+  the server's `config` frame now fails locally with a new
+  `MessageTooLargeError` (`size`, `limit`, in bytes of UTF-8 JSON). Before,
+  the frame went out and the server closed the connection, failing every
+  in-flight call and stream along with it. An oversized subscription reports
+  the error through `onError` and is dropped instead of being retried on
+  every reconnect. Each `config` frame replaces the limit, so servers that
+  disable it, or predate the field, get no local check. The limit carries
+  over a reconnect: calls queued while disconnected are flushed as the socket
+  opens, before the new `config` frame, and are checked against the last
+  advertised limit. The Go client already did this (`ErrMessageTooLarge`).
+
 ## [0.65.0] - 2026-10-03
 
 Adds a Go client: a runtime package, `aprot/client`, and a generator,

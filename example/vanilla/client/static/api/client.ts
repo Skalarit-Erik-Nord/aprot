@@ -204,6 +204,24 @@ export class ConnectionError extends Error {
     isManual(): boolean { return this.reason === 'manual'; }
 }
 
+// MessageTooLargeError fails a call, stream, or subscription whose frame is
+// larger than the server accepts: the maxMessageSize from the server's config
+// frame. The server closes the connection on such a frame, which would fail
+// every call on it, so the client refuses it locally instead. The connection
+// stays up and other calls keep working. size and limit are in bytes of
+// UTF-8 JSON on the wire.
+export class MessageTooLargeError extends Error {
+    readonly size: number;
+    readonly limit: number;
+
+    constructor(size: number, limit: number) {
+        super(`message too large: the message is ${size} bytes, and the server's MaxMessageSize is ${limit} bytes`);
+        this.name = 'MessageTooLargeError';
+        this.size = size;
+        this.limit = limit;
+    }
+}
+
 
 
 
@@ -590,6 +608,14 @@ export class ApiClient {
     // Ids to re-send once their pending first answer arrives (see
     // sendSubscribe).
     private subscribeResend = new Set<string>();
+    // maxMessageSize is the largest frame, in bytes, the server last said it
+    // accepts, or undefined for no limit. Each config frame replaces it, so a
+    // server that disables its limit, or predates the field, lifts it. It
+    // carries over a reconnect until the new connection's config frame
+    // arrives: work queued while disconnected is sent as soon as the socket
+    // opens, before that frame, and the last advertised limit is the best
+    // guess at what the server still enforces.
+    private maxMessageSize: number | undefined;
     private pushHandlers = new Map<string, Set<(data: unknown) => void>>();
     private stateListeners = new Set<(state: ConnectionState) => void>();
     private loadingListeners = new Set<(count: number) => void>();
@@ -1536,7 +1562,11 @@ export class ApiClient {
         reconnectInterval?: number;
         reconnectMaxInterval?: number;
         reconnectMaxAttempts?: number;
+        maxMessageSize?: number;
     }): void {
+        this.maxMessageSize = config.maxMessageSize !== undefined && config.maxMessageSize > 0
+            ? config.maxMessageSize
+            : undefined;
         if (config.reconnectInterval !== undefined) {
             this.options.reconnectInterval = config.reconnectInterval;
         }
@@ -1546,6 +1576,20 @@ export class ApiClient {
         if (config.reconnectMaxAttempts !== undefined) {
             this.options.reconnectMaxAttempts = config.reconnectMaxAttempts;
         }
+    }
+
+    // tooLarge returns the error for a frame larger than the server's
+    // advertised limit, or null when it fits or no limit is known. It
+    // measures the frame as the built-in transport sends it: UTF-8 JSON.
+    private tooLarge(frame: object): MessageTooLargeError | null {
+        const limit = this.maxMessageSize;
+        if (limit === undefined) return null;
+        const json = JSON.stringify(frame);
+        // A UTF-16 code unit is at most 3 bytes of UTF-8, so most frames
+        // fit without being encoded.
+        if (json.length * 3 <= limit) return null;
+        const size = new TextEncoder().encode(json).length;
+        return size > limit ? new MessageTooLargeError(size, limit) : null;
     }
 
     request<T>(method: string, params: unknown[], options?: RequestOptions): Promise<T> {
@@ -1634,7 +1678,16 @@ export class ApiClient {
                 this.notifyLoadingChange();
             }, { once: true });
         }
-        this.transport.send({ type: 'request', id, method, params });
+        const frame = { type: 'request', id, method, params };
+        const tooLarge = this.tooLarge(frame);
+        if (tooLarge) {
+            this.pending.delete(id);
+            onSettle?.();
+            reject(tooLarge);
+            this.notifyLoadingChange();
+            return;
+        }
+        this.transport.send(frame);
         this.notifyLoadingChange();
     }
 
@@ -1703,7 +1756,36 @@ export class ApiClient {
     private writeSubscribe(id: string): void {
         const sub = this.subscriptions.get(id);
         if (!sub) return;
-        this.transport.send({ type: 'subscribe', id, method: sub.method, params: sub.params, ...(sub.onPatch ? { patch: true } : {}) });
+        const frame = { type: 'subscribe', id, method: sub.method, params: sub.params, ...(sub.onPatch ? { patch: true } : {}) };
+        const tooLarge = this.tooLarge(frame);
+        if (tooLarge) {
+            this.dropSubscription(id, tooLarge);
+            return;
+        }
+        this.transport.send(frame);
+    }
+
+    // dropSubscription ends a subscription that can never be sent: its
+    // params do not change, so it would fail again on every reconnect. It
+    // frees the slot at once and reports err through the subscription's
+    // onError a microtask later, so subscribe() never calls back before it
+    // has returned.
+    private dropSubscription(id: string, err: Error): void {
+        const sub = this.subscriptions.get(id);
+        if (!sub) return;
+        this.subscriptions.delete(id);
+        this.subscribeResend.delete(id);
+        if (this.subscribesInFlight.delete(id)) this.scheduleSubscribeDrain();
+        const p = this.pending.get(id);
+        this.pending.delete(id);
+        this.notifyLoadingChange();
+        queueMicrotask(() => {
+            if (p) {
+                p.reject(err);
+            } else {
+                sub.onError?.(err);
+            }
+        });
     }
 
     // subscribeAnswered handles the first answer (a result or an error) to
@@ -1921,9 +2003,16 @@ export class ApiClient {
                 const open = () => {
                     if (ended) return;
                     id = String(++this.requestId);
+                    const frame = { type: 'request', id, method, params };
+                    const tooLarge = this.tooLarge(frame);
+                    if (tooLarge) {
+                        end(tooLarge);
+                        this.notifyLoadingChange();
+                        return;
+                    }
                     this.streams.set(id, { push, end });
                     this.notifyLoadingChange();
-                    this.transport.send({ type: 'request', id, method, params });
+                    this.transport.send(frame);
                 };
 
                 // A stream started while the client is connecting or

@@ -880,6 +880,18 @@ const off = client.onConnectionError((err) => {
 });
 ```
 
+**Oversized messages fail locally.** The server announces its `MaxMessageSize` in the `config` frame. The client refuses a request, stream, or subscription whose frame is larger, with a `MessageTooLargeError` carrying `size` and `limit` (bytes of UTF-8 JSON). Sent anyway, the frame would make the server close the connection and fail every call on it; refused locally, only that call fails and the connection stays up. An oversized subscription reports the error through `onError` and is dropped, since it would fail again on every reconnect.
+
+```typescript
+try {
+    await importRows(client, rows);
+} catch (err) {
+    if (err instanceof MessageTooLargeError) showError(`The import is ${err.size} bytes; the server accepts ${err.limit}.`);
+}
+```
+
+Each `config` frame replaces the limit, so a server that disables it (`MaxMessageSize: -1`) or predates the field gets no local check. The limit carries over a reconnect: calls queued while disconnected are sent as the socket opens, before the new `config` frame, and are checked against the last advertised limit. Calls sent before the client's first `config` frame are not checked; the server still enforces its limit.
+
 **Rejections are terminal by default** — after a `server-rejected` failure the client stops auto-reconnecting, which is the right response to a real sign-out. For short-lived credentials, where a rejection is usually an expired token, propagation lag just after sign-in, or clock skew, opt into retries with `reconnectOnRejected` (pair it with `getConnectParams` / `getAuthToken` so each retry carries a fresh token):
 
 ```typescript
