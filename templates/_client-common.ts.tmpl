@@ -335,8 +335,12 @@ export interface ApiClientOptions {
     reconnectMaxAttempts?: number;
     /**
      * Milliseconds to wait for the transport handshake before giving up on
-     * the attempt. Applies to the built-in WebSocket transport; a
-     * custom ClientTransport enforces its own bound. Without one, a
+     * the attempt. The handshake bound applies to the built-in WebSocket
+     * transport; a custom ClientTransport enforces its own. On every
+     * transport it also bounds the wait for the server's config frame once
+     * the channel is open: after that, the client goes on without a known
+     * maxMessageSize. With 0, a transport that never delivers the config
+     * frame leaves the client in 'connecting'. Without a bound, a
      * handshake that black-holes (e.g. into a dead network path right after
      * wake) pins the client in 'connecting' for the browser's own TCP
      * timeout — often 20-30s — and connect()/reconnectNow() cannot
@@ -622,7 +626,7 @@ export class ApiClient {
         onError?: (error: Error) => void;
         onPatch?: (patch: unknown) => void;
         // Set by the caller's unsubscribe.
-        closed?: boolean;
+        closed: boolean;
     }>();
     private streams = new Map<string, {
         push: (item: unknown) => void;
@@ -886,8 +890,11 @@ export class ApiClient {
             // Nothing is sent before the config frame, so buffered requests,
             // resubscribes and waiting streams are all checked against this
             // server's maxMessageSize. A close while waiting has already been
-            // handled by handleClose().
-            if (await this.waitForConfig() === 'closed' || stale()) return;
+            // handled by handleClose(). So has one that came after the config
+            // frame but before this line: the byte-stream server sends config
+            // ahead of a connect hook's rejection, and a transport can deliver
+            // both, and its close, in one task.
+            if (await this.waitForConfig() === 'closed' || stale() || !this.transport.isConnected()) return;
             // First-message auth: authenticate before the connection is
             // considered ready, so buffered requests/subscriptions only flush
             // after auth_ok. Runs again automatically on every reconnect.

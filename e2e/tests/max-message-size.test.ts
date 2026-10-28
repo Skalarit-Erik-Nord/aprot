@@ -290,7 +290,55 @@ class LimitTransport implements ClientTransport {
     isConnected(): boolean { return this.open; }
 }
 
+// RejectAfterConfigTransport plays a byte-stream server whose connect hook
+// rejects the connection: that server sends config first, then the
+// rejection. Both arrive in one task, and disconnect() reports the close
+// synchronously.
+class RejectAfterConfigTransport implements ClientTransport {
+    private open = false;
+    private onClose: ((i?: TransportCloseInfo) => void) | null = null;
+
+    connect(_url: string, onMessage: (d: string | Blob | ArrayBuffer) => void, onClose: (i?: TransportCloseInfo) => void): Promise<void> {
+        this.onClose = onClose;
+        this.open = true;
+        queueMicrotask(() => {
+            onMessage(JSON.stringify({ type: 'config' }));
+            onMessage(JSON.stringify({ type: 'error', code: -32002, message: 'rejected by hook' }));
+        });
+        return Promise.resolve();
+    }
+    send(): void {}
+    disconnect(): void {
+        if (!this.open) return;
+        this.open = false;
+        this.onClose?.({ code: 1000, wasClean: true });
+    }
+    isConnected(): boolean { return this.open; }
+}
+
 describe('maxMessageSize with a custom transport', () => {
+    test('a rejection right after the config frame leaves the client disconnected', async () => {
+        const client = new ApiClient('ws://unused', { transport: new RejectAfterConfigTransport(), reconnect: false });
+        await client.connect();
+        await sleep(10);
+
+        expect(client.getState()).toBe('disconnected');
+        expect(client.getLastConnectionError()?.isServerRejected()).toBe(true);
+    });
+
+    test('disconnect() during the config wait settles connect() at once', async () => {
+        const client = new ApiClient('ws://unused', { transport: new LimitTransport(null), reconnect: false, connectTimeout: 10000 });
+        const connecting = client.connect();
+        await sleep(10);
+        expect(client.getState()).toBe('connecting');
+
+        const started = Date.now();
+        client.disconnect();
+        await connecting;
+        expect(Date.now() - started).toBeLessThan(1000);
+        expect(client.getState()).toBe('disconnected');
+    });
+
     test('the transport gets the limit and its refusal fails only that call', async () => {
         const t = new LimitTransport({ type: 'config', maxMessageSize: 100 });
         const client = new ApiClient('ws://unused', { transport: t, reconnect: false });
