@@ -620,6 +620,9 @@ export class ApiClient {
         options?: RequestOptions;
         resolve: (value: unknown) => void;
         reject: (error: Error) => void;
+        // Removes the entry's abort listener. Every way out of the buffer
+        // calls it, as sendRequest does for a sent request.
+        removeAbortListener?: () => void;
     }> = [];
     private subscriptions = new Map<string, {
         method: string;
@@ -892,7 +895,6 @@ export class ApiClient {
             },
         ).then(async () => {
             if (stale()) return;
-            this.reconnectAttempts = 0;
             // Nothing is sent before the config frame, so buffered requests,
             // resubscribes and waiting streams are all checked against this
             // server's maxMessageSize. A close while waiting has already been
@@ -915,6 +917,10 @@ export class ApiClient {
                 this.handleClose({ wasClean: false });
                 return;
             }
+            // The server answered, so the backoff starts over. Reset only now:
+            // a channel that opens but never delivers config must keep
+            // growing the backoff and count toward reconnectMaxAttempts.
+            this.reconnectAttempts = 0;
             // First-message auth: authenticate before the connection is
             // considered ready, so buffered requests/subscriptions only flush
             // after auth_ok. Runs again automatically on every reconnect.
@@ -1754,24 +1760,29 @@ export class ApiClient {
                 return;
             }
             if (this.state === 'connecting' || this.state === 'reconnecting') {
-                const entry = { method, params, options, resolve: res, reject };
+                const entry = { method, params, options, resolve: res, reject, removeAbortListener: undefined as (() => void) | undefined };
                 this.buffer.push(entry);
                 this.notifyLoadingChange();
-                if (options?.signal) {
-                    if (options.signal.aborted) {
+                const signal = options?.signal;
+                if (signal) {
+                    if (signal.aborted) {
                         this.buffer.pop();
+                        options?._onSettle?.();
                         reject(new Error('Request aborted'));
                         this.notifyLoadingChange();
                         return;
                     }
-                    options.signal.addEventListener('abort', () => {
+                    const onAbort = () => {
                         const idx = this.buffer.indexOf(entry);
                         if (idx !== -1) {
                             this.buffer.splice(idx, 1);
+                            options?._onSettle?.();
                             reject(new Error('Request aborted'));
                             this.notifyLoadingChange();
                         }
-                    }, { once: true });
+                    };
+                    signal.addEventListener('abort', onAbort, { once: true });
+                    entry.removeAbortListener = () => signal.removeEventListener('abort', onAbort);
                 }
                 return;
             }
@@ -1848,7 +1859,10 @@ export class ApiClient {
         const buffered = this.buffer;
         this.buffer = [];
         for (const entry of buffered) {
+            // sendRequest attaches its own listener for the sent request.
+            entry.removeAbortListener?.();
             if (entry.options?.signal?.aborted) {
+                entry.options._onSettle?.();
                 entry.reject(new Error('Request aborted'));
                 this.notifyLoadingChange();
                 continue;
@@ -1861,6 +1875,8 @@ export class ApiClient {
         const buffered = this.buffer;
         this.buffer = [];
         for (const entry of buffered) {
+            entry.removeAbortListener?.();
+            entry.options?._onSettle?.();
             entry.reject(error);
         }
         this.notifyLoadingChange();

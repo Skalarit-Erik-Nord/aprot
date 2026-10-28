@@ -1,7 +1,7 @@
 import { getEventListeners } from 'node:events';
 import { describe, test, expect, afterEach, vi } from 'vitest';
 import { wsUrl, wsSmallLimitUrl, wsNoLimitUrl } from './helpers';
-import { ApiClient, MessageTooLargeError, type ClientTransport, type ConnectionState, type TransportCloseInfo } from '../api/client';
+import { ApiClient, ConnectionError, MessageTooLargeError, type ClientTransport, type ConnectionState, type TransportCloseInfo } from '../api/client';
 import { setBlob, subscribeSetBlob } from '../api/blob-handlers';
 import { getConnURL } from '../api/conn-handlers';
 import { numbers } from '../api/streaming-handlers';
@@ -267,6 +267,7 @@ class LimitTransport implements ClientTransport {
     sent: Array<Record<string, unknown>> = [];
     answerRequests = true;
     refuse = new Set<string>();
+    connects = 0;
     private onMessage: ((d: string) => void) | null = null;
     private onClose: ((i?: TransportCloseInfo) => void) | null = null;
     private open = false;
@@ -276,6 +277,7 @@ class LimitTransport implements ClientTransport {
         this.onMessage = onMessage as (d: string) => void;
         this.onClose = onClose;
         this.open = true;
+        this.connects++;
         if (this.config) this.deliver(this.config);
         return Promise.resolve();
     }
@@ -392,6 +394,19 @@ describe('maxMessageSize with a custom transport', () => {
         expect(await request).toBe(errors[0]);
     });
 
+    test('attempts with no config frame count toward reconnectMaxAttempts', async () => {
+        const t = new LimitTransport(null);
+        const client = new ApiClient('ws://unused', {
+            transport: t, connectTimeout: 20, reconnectInterval: 5, reconnectMaxInterval: 5, reconnectMaxAttempts: 2,
+        });
+        await client.connect();
+        await sleep(400);
+
+        // The first attempt and two retries, then the client gives up.
+        expect(t.connects).toBe(3);
+        expect(client.getState()).toBe('disconnected');
+    });
+
     test('with connectTimeout 0 the config wait is still bounded', async () => {
         vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
         const client = new ApiClient('ws://unused', { transport: new LimitTransport(null), reconnect: false, connectTimeout: 0 });
@@ -489,5 +504,49 @@ describe('abort listeners', () => {
         ac.abort();
         await sleep(10);
         expect(frames.filter((f) => f.type === 'cancel')).toEqual([]);
+    });
+
+    test('a request buffered while connecting leaves no listener once it settles', async () => {
+        const c = newClient(wsSmallLimitUrl());
+        client = c.client;
+        const ac = new AbortController();
+
+        const connecting = client.connect();
+        const request = setBlob(client, 'fits', { signal: ac.signal });
+        await connecting;
+        await expect(request).resolves.toBeNull();
+
+        expect(getEventListeners(ac.signal, 'abort')).toHaveLength(0);
+    });
+
+    // _onSettle is how tasks.ts removes its push listeners, so a buffered
+    // request that leaves the buffer unsent must still call it.
+    test('a buffered request aborted before it goes out settles its options', async () => {
+        // No config frame arrives, so the request stays buffered.
+        client = new ApiClient('ws://unused', { transport: new LimitTransport(null), reconnect: false });
+        const settled: string[] = [];
+        void client.connect();
+        const ac = new AbortController();
+        const request = client.request('BlobHandlers.SetBlob', ['a'], { signal: ac.signal, _onSettle: () => settled.push('settled') });
+
+        ac.abort();
+        await expect(request).rejects.toThrow('Request aborted');
+        expect(settled).toEqual(['settled']);
+    });
+
+    test('a buffered request rejected with the buffer settles its options and listener', async () => {
+        // The attempt gets no config frame and, with reconnect off, the
+        // client gives up and rejects the buffer.
+        client = new ApiClient('ws://unused', { transport: new LimitTransport(null), reconnect: false, connectTimeout: 20 });
+        const settled: string[] = [];
+        const ac = new AbortController();
+        const connecting = client.connect();
+        const request = client.request('BlobHandlers.SetBlob', ['b'], { signal: ac.signal, _onSettle: () => settled.push('settled') })
+            .catch((e: unknown) => e);
+        await connecting;
+
+        expect(await request).toBeInstanceOf(ConnectionError);
+        expect(settled).toEqual(['settled']);
+        expect(getEventListeners(ac.signal, 'abort')).toHaveLength(0);
     });
 });
