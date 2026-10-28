@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/marrasen/aprot"
 	"github.com/marrasen/aprot/e2e/e2eapi"
@@ -85,7 +86,9 @@ func main() {
 	// Print address as the first line of stdout — test setup reads this.
 	fmt.Println(listener.Addr().String())
 
-	if err := http.Serve(listener, mux); err != nil {
+	// Only the header read is bounded: WebSocket connections are long-lived.
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	if err := srv.Serve(listener); err != nil {
 		log.Fatal(err)
 	}
 }
