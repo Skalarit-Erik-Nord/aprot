@@ -123,7 +123,7 @@ func main() {
 	mux.Handle("/ws", server) // WebSocket transport
 
 	const addr = "127.0.0.1:8080"
-	httpServer := &http.Server{Addr: addr, Handler: mux}
+	httpServer := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)

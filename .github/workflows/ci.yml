@@ -72,25 +72,25 @@ jobs:
       - name: Lint root module
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13
+          version: v2.15
           working-directory: .
 
       - name: Lint example/vanilla module
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13
+          version: v2.15
           working-directory: example/vanilla
 
       - name: Lint example/react module
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13
+          version: v2.15
           working-directory: example/react
 
       - name: Lint e2e module
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13
+          version: v2.15
           working-directory: e2e
 
   govulncheck:

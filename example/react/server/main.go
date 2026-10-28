@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/marrasen/aprot"
 	"github.com/marrasen/aprot/example/react/api"
@@ -46,7 +47,9 @@ func main() {
 	}
 	fmt.Println("\nOpen http://localhost:8080 in your browser")
 
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	// Only the header read is bounded: WebSocket connections are long-lived.
+	srv := &http.Server{Addr: addr, ReadHeaderTimeout: 10 * time.Second}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
