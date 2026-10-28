@@ -1,8 +1,10 @@
+import { getEventListeners } from 'node:events';
 import { describe, test, expect, afterEach, vi } from 'vitest';
-import { wsSmallLimitUrl, wsNoLimitUrl } from './helpers';
+import { wsUrl, wsSmallLimitUrl, wsNoLimitUrl } from './helpers';
 import { ApiClient, MessageTooLargeError, type ClientTransport, type ConnectionState, type TransportCloseInfo } from '../api/client';
 import { setBlob, subscribeSetBlob } from '../api/blob-handlers';
 import { getConnURL } from '../api/conn-handlers';
+import { numbers } from '../api/streaming-handlers';
 
 // The /ws-small server advertises maxMessageSize 4096 in its config frame. A
 // frame larger than that would make the server close the socket, failing
@@ -256,17 +258,23 @@ describe('maxMessageSize from the config frame', () => {
 });
 
 // LimitTransport is a custom transport that enforces the limit itself, the
-// way the ClientTransport contract describes: it answers every request with
-// null, and refuses a frame over the limit it was given.
+// way the ClientTransport contract describes: it refuses a frame over the
+// limit it was given, answers auth with auth_ok, and answers requests with
+// null unless answerRequests is off. Frame types in refuse throw from send(),
+// as a transport whose channel fails would.
 class LimitTransport implements ClientTransport {
     limits: Array<number | undefined> = [];
     sent: Array<Record<string, unknown>> = [];
+    answerRequests = true;
+    refuse = new Set<string>();
     private onMessage: ((d: string) => void) | null = null;
+    private onClose: ((i?: TransportCloseInfo) => void) | null = null;
     private open = false;
     constructor(private config: object | null) {}
 
-    connect(_url: string, onMessage: (d: string | Blob | ArrayBuffer) => void, _onClose: (i?: TransportCloseInfo) => void): Promise<void> {
+    connect(_url: string, onMessage: (d: string | Blob | ArrayBuffer) => void, onClose: (i?: TransportCloseInfo) => void): Promise<void> {
         this.onMessage = onMessage as (d: string) => void;
+        this.onClose = onClose;
         this.open = true;
         if (this.config) this.deliver(this.config);
         return Promise.resolve();
@@ -275,18 +283,25 @@ class LimitTransport implements ClientTransport {
         this.limits.push(limit);
     }
     send(message: object): void {
+        const m = message as Record<string, unknown>;
+        if (this.refuse.has(m.type as string)) throw new Error(`channel refused ${m.type as string}`);
         const data = JSON.stringify(message);
         const limit = this.limits[this.limits.length - 1];
         if (limit !== undefined && data.length > limit) throw new MessageTooLargeError(data.length, limit);
-        const m = message as Record<string, unknown>;
         this.sent.push(m);
-        if (m.type === 'request') this.deliver({ type: 'response', id: m.id, result: null });
+        if (m.type === 'auth') this.deliver({ type: 'auth_ok' });
+        else if (m.type === 'request' && this.answerRequests) this.deliver({ type: 'response', id: m.id, result: null });
     }
     private deliver(m: object): void {
         const cb = this.onMessage;
         queueMicrotask(() => cb?.(JSON.stringify(m)));
     }
-    disconnect(): void { this.open = false; }
+    disconnect(): void {
+        if (!this.open) return;
+        this.open = false;
+        const cb = this.onClose;
+        queueMicrotask(() => cb?.({ code: 1000, wasClean: true }));
+    }
     isConnected(): boolean { return this.open; }
 }
 
@@ -317,6 +332,10 @@ class RejectAfterConfigTransport implements ClientTransport {
 }
 
 describe('maxMessageSize with a custom transport', () => {
+    // A test that times out never reaches its own cleanup, so fake timers
+    // must not outlive it and stall the next test's sleeps.
+    afterEach(() => { vi.useRealTimers(); });
+
     test('a rejection right after the config frame leaves the client disconnected', async () => {
         const client = new ApiClient('ws://unused', { transport: new RejectAfterConfigTransport(), reconnect: false });
         await client.connect();
@@ -353,17 +372,122 @@ describe('maxMessageSize with a custom transport', () => {
         client.disconnect();
     });
 
-    test('a transport that never delivers a config frame connects after connectTimeout', async () => {
+    test('an attempt with no config frame fails with an error that says so', async () => {
         const t = new LimitTransport(null);
         const client = new ApiClient('ws://unused', { transport: t, reconnect: false, connectTimeout: 50 });
+        const errors: Error[] = [];
+        client.onConnectionError((e) => errors.push(e));
 
-        const started = Date.now();
         const connecting = client.connect();
-        const request = client.request('BlobHandlers.SetBlob', ['fits']);
+        const request = client.request('BlobHandlers.SetBlob', ['fits']).catch((e: unknown) => e);
         await connecting;
-        expect(Date.now() - started).toBeGreaterThanOrEqual(40);
-        expect(client.getState()).toBe('connected');
-        await expect(request).resolves.toBeNull();
+        await sleep(10);
+
+        expect(client.getState()).toBe('disconnected');
+        expect(t.sent).toEqual([]);
+        // Reported once: the transport's own close report is not handled again.
+        expect(errors).toHaveLength(1);
+        expect(errors[0].message).toContain('no config frame arrived within 50 ms');
+        expect(client.getLastConnectionError()?.isNetworkError()).toBe(true);
+        expect(await request).toBe(errors[0]);
+    });
+
+    test('with connectTimeout 0 the config wait is still bounded', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        const client = new ApiClient('ws://unused', { transport: new LimitTransport(null), reconnect: false, connectTimeout: 0 });
+        const connecting = client.connect();
+        await vi.advanceTimersByTimeAsync(10_000);
+        await connecting;
+
+        expect(client.getState()).toBe('disconnected');
+        expect(client.getLastConnectionError()?.message).toContain('no config frame arrived within 10000 ms');
+    });
+
+    test('an auth frame over the limit is reported with its cause', async () => {
+        const t = new LimitTransport({ type: 'config', maxMessageSize: 100 });
+        const rejections: Error[] = [];
+        const client = new ApiClient('ws://unused', {
+            transport: t,
+            reconnect: false,
+            getAuthToken: () => 'x'.repeat(200),
+            onConnectionRejected: (e) => rejections.push(e),
+        });
+        await client.connect();
+        await sleep(10);
+
+        expect(rejections).toHaveLength(1);
+        expect(rejections[0].message).toMatch(/^authentication failed: message too large: the message is \d+ bytes/);
+        expect(client.getState()).toBe('disconnected');
+    });
+
+    test('a refused refreshAuth frame leaves no auth waiter behind', async () => {
+        const t = new LimitTransport({ type: 'config', maxMessageSize: 100 });
+        const client = new ApiClient('ws://unused', { transport: t, reconnect: false, getAuthToken: () => 'tok' });
+        await client.connect();
+
+        await expect(client.refreshAuth('x'.repeat(200))).rejects.toBeInstanceOf(MessageTooLargeError);
+        // No answer will come for a frame that never went out, so nothing may
+        // wait for one: a later id-less auth_error would be taken as its answer.
+        expect((client as unknown as { authWaiter: unknown }).authWaiter).toBeNull();
+        await expect(client.refreshAuth('tok2')).resolves.toBeUndefined();
         client.disconnect();
+    });
+
+    test('a cancel or unsubscribe the transport refuses neither throws nor hangs the call', async () => {
+        const t = new LimitTransport({ type: 'config' });
+        t.answerRequests = false;
+        t.refuse = new Set(['cancel', 'unsubscribe']);
+        const client = new ApiClient('ws://unused', { transport: t, reconnect: false });
+        await client.connect();
+
+        const ac = new AbortController();
+        const request = client.request('BlobHandlers.SetBlob', ['fits'], { signal: ac.signal });
+        ac.abort();
+        const outcome = await Promise.race([
+            request.then(() => 'resolved', (e: Error) => e.message),
+            sleep(200).then(() => 'still pending'),
+        ]);
+        expect(outcome).toBe('Request aborted');
+
+        const unsubscribe = client.subscribe('BlobHandlers.GetBlob', [], () => {});
+        expect(() => unsubscribe()).not.toThrow();
+        expect(client.getLoadingCount()).toBe(0);
+        client.disconnect();
+    });
+});
+
+describe('abort listeners', () => {
+    let client: ApiClient | undefined;
+
+    afterEach(() => {
+        client?.disconnect();
+        client = undefined;
+    });
+
+    test('a finished request or stream leaves no listener on its signal', async () => {
+        // The main endpoint has the streaming handlers and the default 4 MiB
+        // limit, so the refused calls need a payload over 4 MiB.
+        client = (await connected(wsUrl())).client;
+        const huge = 'x'.repeat(5 * 1024 * 1024);
+        const ac = new AbortController();
+
+        await setBlob(client, 'fits', { signal: ac.signal });
+        await expect(setBlob(client, huge, { signal: ac.signal })).rejects.toBeInstanceOf(MessageTooLargeError);
+        for await (const _ of numbers(client, 2, 0, { signal: ac.signal })) {
+            // Drain the stream to its end.
+        }
+        const refused = async () => {
+            for await (const _ of client!.requestStream('StreamingHandlers.Numbers', [huge], { signal: ac.signal })) {
+                // Never reached: the stream fails before it is sent.
+            }
+        };
+        await expect(refused()).rejects.toBeInstanceOf(MessageTooLargeError);
+
+        expect(getEventListeners(ac.signal, 'abort')).toHaveLength(0);
+        // So aborting the shared signal later cancels nothing.
+        const frames = recordFrames(client);
+        ac.abort();
+        await sleep(10);
+        expect(frames.filter((f) => f.type === 'cancel')).toEqual([]);
     });
 });

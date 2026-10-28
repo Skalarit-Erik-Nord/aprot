@@ -35,8 +35,20 @@ This file was introduced at v0.44.0; for the history of earlier releases see the
   reconnecting go out once that connection's `config` frame has arrived, so
   they are checked against the limit of the server they go to. `connect()`
   resolves at the same point. Both server transports send `config` first on
-  every connection. A custom `ClientTransport` that drops it makes the client
-  wait `connectTimeout` (default 10 s) and then go on without a known limit.
+  every connection. An attempt that gets no `config` frame within
+  `connectTimeout` (10 s when that is 0) fails with a `network-error` that
+  says so, and reconnects normally. So a custom `ClientTransport` must
+  forward that frame.
+- **An auth failure raised on the client keeps its cause.** When
+  `getAuthToken` fails, or the auth frame is larger than the server's
+  `maxMessageSize`, the `AuthFailed` error reads `authentication failed:
+  <cause>` instead of a bare `authentication failed`.
+- **Abort listeners are removed when a call settles.** A request or stream
+  that finishes no longer leaves its listener on the `AbortSignal`, so a
+  signal shared by many calls does not collect them, and aborting it later
+  sends no `cancel` for a finished request. A `cancel` or `unsubscribe` frame
+  the transport refuses is dropped instead of throwing out of the abort
+  listener or the unsubscribe call.
 
 ## [0.65.0] - 2026-10-03
 
